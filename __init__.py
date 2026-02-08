@@ -34,13 +34,15 @@ Version: 2.1.0
 License: MIT
 """
 # At the top of your __init__.py
-from .nodes import h200_optimizations  # Auto-applies optimizations on import
+# Auto-applies optimizations on import
 # Only run initialization and imports when loaded by ComfyUI, not during pytest
 # This prevents relative import errors when pytest collects test modules
+from .nodes import h200_optimizations
 import os
 import sys
 import traceback
-
+from .nodes.fast_mask_composite import NODE_CLASS_MAPPINGS as FAST_MASK_NODES
+NODE_CLASS_MAPPINGS.update(FAST_MASK_NODES)
 # Version info
 __version__ = "3.0.0"  # Major refactor for memory management
 
