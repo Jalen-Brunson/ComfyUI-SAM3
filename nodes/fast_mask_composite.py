@@ -336,6 +336,111 @@ class FastMaskBlur:
         return (mask.clamp(0, 1),)
 
 
+class FastImageToMask:
+    """
+    Fast conversion from image to mask. GPU-optimized.
+    
+    For white-on-black mask videos, this is 100x+ faster than Color to Mask.
+    Simply extracts a channel and optionally thresholds.
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE", {
+                    "tooltip": "Image batch [N, H, W, C] - typically a mask video"
+                }),
+            },
+            "optional": {
+                "channel": (["red", "green", "blue", "average"], {
+                    "default": "red",
+                    "tooltip": "Channel to extract. For grayscale/B&W masks, any channel works (red is fastest)."
+                }),
+                "threshold": ("FLOAT", {
+                    "default": 0.0,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "step": 0.01,
+                    "tooltip": "Threshold for binary mask. 0=no threshold (keep grayscale), >0=binary cutoff."
+                }),
+                "invert": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Invert the mask (swap black/white)"
+                }),
+            }
+        }
+    
+    RETURN_TYPES = ("MASK",)
+    RETURN_NAMES = ("mask",)
+    FUNCTION = "convert"
+    CATEGORY = "mask"
+    
+    def convert(self, image: torch.Tensor, channel: str = "red", 
+                threshold: float = 0.0, invert: bool = False) -> tuple:
+        """
+        Convert image to mask by extracting a channel.
+        
+        For white-on-black masks, this is essentially free - just a tensor slice.
+        """
+        # image is [N, H, W, C]
+        
+        if channel == "red":
+            mask = image[:, :, :, 0]
+        elif channel == "green":
+            mask = image[:, :, :, 1]
+        elif channel == "blue":
+            mask = image[:, :, :, 2]
+        elif channel == "average":
+            mask = image.mean(dim=-1)
+        else:
+            mask = image[:, :, :, 0]
+        
+        # Apply threshold if requested
+        if threshold > 0:
+            mask = (mask > threshold).float()
+        
+        # Invert if requested
+        if invert:
+            mask = 1.0 - mask
+        
+        return (mask,)
+
+
+class FastMaskToImage:
+    """
+    Fast conversion from mask to RGB image. GPU-optimized.
+    
+    Converts grayscale mask to 3-channel image.
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "mask": ("MASK", {
+                    "tooltip": "Mask [N, H, W]"
+                }),
+            },
+        }
+    
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "convert"
+    CATEGORY = "mask"
+    
+    def convert(self, mask: torch.Tensor) -> tuple:
+        """Convert mask to RGB image by expanding to 3 channels."""
+        # mask is [N, H, W], need [N, H, W, C]
+        if mask.dim() == 2:
+            mask = mask.unsqueeze(0)
+        
+        # Expand to RGB
+        image = mask.unsqueeze(-1).expand(-1, -1, -1, 3)
+        
+        return (image,)
+
+
 class FastImageBlend:
     """
     Fast alpha blend between two images.
@@ -393,6 +498,8 @@ NODE_CLASS_MAPPINGS = {
     "FastMaskInvert": FastMaskInvert,
     "FastMaskBlur": FastMaskBlur,
     "FastImageBlend": FastImageBlend,
+    "FastImageToMask": FastImageToMask,
+    "FastMaskToImage": FastMaskToImage,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -401,4 +508,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FastMaskInvert": "Fast Mask Invert",
     "FastMaskBlur": "Fast Mask Blur",
     "FastImageBlend": "Fast Image Blend",
+    "FastImageToMask": "Fast Image to Mask",
+    "FastMaskToImage": "Fast Mask to Image",
 }
