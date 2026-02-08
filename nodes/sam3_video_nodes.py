@@ -658,32 +658,43 @@ class SAM3VideoOutput:
                 "scores": ("SAM3_VIDEO_SCORES", {
                     "tooltip": "Confidence scores from SAM3Propagate"
                 }),
-                "obj_id": ("INT", {
-                    "default": -1,
-                    "min": -1,
-                    "tooltip": "Specific object ID for mask output (-1 for all combined). Changing this is fast - no re-inference needed."
+                "obj_ids": ("STRING", {
+                    "default": "-1",
+                    "tooltip": "Object IDs for mask output. Use -1 for all combined, or comma-separated IDs like '0,1,2' for specific objects."
                 }),
                 "plot_all_masks": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "Show all object masks in visualization (True) or only selected obj_id (False)"
+                    "tooltip": "Show all object masks in visualization (True) or only selected obj_ids (False)"
+                }),
+                "skip_visualization": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Skip frame loading and visualization (much faster). Returns masks only, frames/visualization outputs will be empty."
+                }),
+                "use_disk_streaming": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Stream output to disk to avoid OOM on very large videos. Only used when skip_visualization=False."
                 }),
             }
         }
 
     @classmethod
-    def IS_CHANGED(cls, masks, video_state, scores=None, obj_id=-1, plot_all_masks=True):
+    def IS_CHANGED(cls, masks, video_state, scores=None, obj_ids="-1", plot_all_masks=True, skip_visualization=True, use_disk_streaming=False):
         # Always re-run this node when params change, but this is cheap
         # The key is that changing these here does NOT invalidate upstream cache
         # ComfyUI caches based on input values - masks/video_state don't change
-        return (id(masks), video_state.session_uuid, id(scores), obj_id, plot_all_masks)
+        return (id(masks), video_state.session_uuid, id(scores), obj_ids, plot_all_masks, skip_visualization, use_disk_streaming)
 
     RETURN_TYPES = ("MASK", "IMAGE", "IMAGE")
     RETURN_NAMES = ("masks", "frames", "visualization")
     FUNCTION = "extract"
     CATEGORY = "SAM3/video"
 
-    def _draw_legend(self, vis_frame, num_objects, colors, obj_id=-1, frame_scores=None):
-        """Draw a legend showing object IDs, colors, and confidence scores (sorted by confidence)."""
+    def _draw_legend(self, vis_frame, num_objects, colors, obj_ids=None, frame_scores=None):
+        """Draw a legend showing object IDs, colors, and confidence scores (sorted by confidence).
+        
+        Args:
+            obj_ids: List of object IDs to show, or None for all objects
+        """
         h, w = vis_frame.shape[:2]
 
         # Legend parameters
@@ -693,9 +704,14 @@ class SAM3VideoOutput:
         legend_item_height = box_size + padding
 
         # Build list of (obj_id, score) pairs
-        if obj_id >= 0:
-            items = [(obj_id, frame_scores[obj_id] if frame_scores is not None and obj_id < len(frame_scores) else None)]
+        if obj_ids is not None and len(obj_ids) > 0:
+            # Show only specified object IDs
+            items = []
+            for oid in obj_ids:
+                score = frame_scores[oid] if frame_scores is not None and oid < len(frame_scores) else None
+                items.append((oid, score))
         else:
+            # Show all objects
             items = []
             for oid in range(num_objects):
                 score = frame_scores[oid] if frame_scores is not None and oid < len(frame_scores) else None
@@ -777,25 +793,42 @@ class SAM3VideoOutput:
             elif char == ' ':
                 curr_x += char_width  # Space
 
-    def extract(self, masks, video_state, scores=None, obj_id=-1, plot_all_masks=True):
-        """Extract all masks as a batch [N, H, W] using memory-mapped streaming.
+    def extract(self, masks, video_state, scores=None, obj_ids="-1", plot_all_masks=True, skip_visualization=True, use_disk_streaming=False):
+        """Extract all masks as a batch [N, H, W].
 
-        Uses numpy.memmap to write output directly to disk, avoiding OOM for large videos.
-        Memory usage is ~100MB regardless of video size (vs 32GB+ for 551 frames at 1080p).
+        When skip_visualization=True (default): Only extracts masks, skips frame loading
+        and visualization. Much faster for large videos. Returns empty tensors for frames/vis.
+        
+        When skip_visualization=False:
+          - use_disk_streaming=True: Uses numpy.memmap to write output directly to disk
+          - use_disk_streaming=False: Accumulates in RAM for faster processing
+        
+        obj_ids: "-1" for all objects combined, or comma-separated like "0,1,2" for specific objects.
         """
         from PIL import Image
         import os
 
+        # Parse obj_ids string into list of integers
+        selected_obj_ids = None  # None means all objects combined
+        if obj_ids.strip() != "-1":
+            try:
+                selected_obj_ids = [int(x.strip()) for x in obj_ids.split(",") if x.strip()]
+                if not selected_obj_ids:
+                    selected_obj_ids = None
+                else:
+                    print(f"[SAM3 Video Output] Filtering to object IDs: {selected_obj_ids}")
+            except ValueError:
+                print(f"[SAM3 Video Output] Warning: Could not parse obj_ids '{obj_ids}', using all objects")
+                selected_obj_ids = None
+
         # Create cache key
-        cache_key = (id(masks), video_state.session_uuid, id(scores), obj_id, plot_all_masks)
+        cache_key = (id(masks), video_state.session_uuid, id(scores), obj_ids, plot_all_masks, skip_visualization, use_disk_streaming)
 
         # Check if we have cached result
         if cache_key in SAM3VideoOutput._cache:
             print(f"[SAM3 Video Output] CACHE HIT - returning cached result for session={video_state.session_uuid[:8]}")
             return SAM3VideoOutput._cache[cache_key]
 
-        print(f"[SAM3 Video Output] CACHE MISS - streaming extraction for session={video_state.session_uuid[:8]}")
-        print_vram("Before extract")
         h, w = video_state.height, video_state.width
         num_frames = video_state.num_frames
 
@@ -806,25 +839,79 @@ class SAM3VideoOutput:
             return (empty_mask, empty_frames, empty_frames)
 
         # ============================================================
-        # STREAMING: Create memory-mapped files on disk
-        # Data is written directly to disk, not accumulated in RAM
+        # FAST PATH: skip_visualization - just extract masks
         # ============================================================
-        mmap_dir = os.path.join(video_state.temp_dir, "mmap_output")
-        os.makedirs(mmap_dir, exist_ok=True)
+        if skip_visualization:
+            print(f"[SAM3 Video Output] Fast extraction (skip_visualization=True) for {num_frames} frames")
+            print_vram("Before fast extract")
+            
+            mask_list = []
+            for frame_idx in range(num_frames):
+                if frame_idx in masks:
+                    frame_mask = masks[frame_idx]
+                    
+                    # Convert numpy to torch if needed
+                    if isinstance(frame_mask, np.ndarray):
+                        frame_mask = torch.from_numpy(frame_mask)
+                    
+                    # Handle different mask formats
+                    if frame_mask.dim() == 4:
+                        frame_mask = frame_mask.squeeze(0)
+                    
+                    # Check for empty mask
+                    if frame_mask.numel() == 0 or (frame_mask.dim() == 3 and frame_mask.shape[0] == 0):
+                        frame_mask = torch.zeros(h, w)
+                    elif frame_mask.dim() == 3 and frame_mask.shape[0] >= 1:
+                        # Multiple objects - combine selected or all
+                        if selected_obj_ids is not None:
+                            # Combine only selected object IDs
+                            combined = torch.zeros(h, w)
+                            for oid in selected_obj_ids:
+                                if oid < frame_mask.shape[0]:
+                                    om = frame_mask[oid].float()
+                                    if om.numel() > 0 and om.max() > 1.0:
+                                        om = om / 255.0
+                                    combined = torch.max(combined, om)
+                            frame_mask = combined
+                        else:
+                            # Combine all objects
+                            combined = torch.zeros(h, w)
+                            for oid in range(frame_mask.shape[0]):
+                                om = frame_mask[oid].float()
+                                if om.numel() > 0 and om.max() > 1.0:
+                                    om = om / 255.0
+                                combined = torch.max(combined, om)
+                            frame_mask = combined
+                    else:
+                        if frame_mask.dim() == 3:
+                            frame_mask = frame_mask.squeeze(0)
+                        frame_mask = frame_mask.float()
+                    
+                    # Normalize if needed
+                    if frame_mask.numel() > 0 and frame_mask.max() > 1.0:
+                        frame_mask = frame_mask / 255.0
+                    
+                    mask_list.append(frame_mask.cpu())
+                else:
+                    mask_list.append(torch.zeros(h, w))
+            
+            all_masks = torch.stack(mask_list, dim=0)
+            # Return empty tensors for frames and visualization
+            empty_frames = torch.zeros(1, h, w, 3)  # Minimal placeholder
+            
+            print(f"[SAM3 Video] Fast extract complete: {all_masks.shape[0]} masks")
+            print_vram("After fast extract")
+            
+            result = (all_masks, empty_frames, empty_frames)
+            SAM3VideoOutput._cache[cache_key] = result
+            return result
 
-        mask_path = os.path.join(mmap_dir, "masks.mmap")
-        frame_path = os.path.join(mmap_dir, "frames.mmap")
-        vis_path = os.path.join(mmap_dir, "vis.mmap")
-
-        # Create memory-mapped arrays (written to disk, not RAM)
-        mask_mmap = np.memmap(mask_path, dtype='float32', mode='w+',
-                              shape=(num_frames, h, w))
-        frame_mmap = np.memmap(frame_path, dtype='float32', mode='w+',
-                               shape=(num_frames, h, w, 3))
-        vis_mmap = np.memmap(vis_path, dtype='float32', mode='w+',
-                             shape=(num_frames, h, w, 3))
-
-        print(f"[SAM3 Video] Streaming {num_frames} frames to disk: {mmap_dir}")
+        # ============================================================
+        # FULL PATH: Load frames and create visualization
+        # ============================================================
+        mode_str = "disk streaming" if use_disk_streaming else "in-memory"
+        print(f"[SAM3 Video Output] Full extraction ({mode_str}) for session={video_state.session_uuid[:8]}")
+        print_vram("Before extract")
 
         # Color palette for multiple objects (RGB, 0-1 range)
         colors = [
@@ -841,8 +928,38 @@ class SAM3VideoOutput:
         # Track number of objects for legend
         num_objects = 0
 
+        if use_disk_streaming:
+            # ============================================================
+            # DISK STREAMING MODE: Create memory-mapped files on disk
+            # Data is written directly to disk, not accumulated in RAM
+            # ============================================================
+            mmap_dir = os.path.join(video_state.temp_dir, "mmap_output")
+            os.makedirs(mmap_dir, exist_ok=True)
+
+            mask_path = os.path.join(mmap_dir, "masks.mmap")
+            frame_path = os.path.join(mmap_dir, "frames.mmap")
+            vis_path = os.path.join(mmap_dir, "vis.mmap")
+
+            # Create memory-mapped arrays (written to disk, not RAM)
+            mask_mmap = np.memmap(mask_path, dtype='float32', mode='w+',
+                                  shape=(num_frames, h, w))
+            frame_mmap = np.memmap(frame_path, dtype='float32', mode='w+',
+                                   shape=(num_frames, h, w, 3))
+            vis_mmap = np.memmap(vis_path, dtype='float32', mode='w+',
+                                 shape=(num_frames, h, w, 3))
+
+            print(f"[SAM3 Video] Streaming {num_frames} frames to disk: {mmap_dir}")
+        else:
+            # ============================================================
+            # IN-MEMORY MODE: Accumulate in lists (faster but uses more RAM)
+            # ============================================================
+            mask_list = []
+            frame_list = []
+            vis_list = []
+            print(f"[SAM3 Video] Processing {num_frames} frames in memory")
+
         # ============================================================
-        # Process ONE frame at a time, write directly to disk
+        # Process ONE frame at a time
         # ============================================================
         for frame_idx in range(num_frames):
             # Load original frame from disk (already stored as JPEG)
@@ -855,8 +972,11 @@ class SAM3VideoOutput:
                 img_np = np.zeros((h, w, 3), dtype=np.float32)
                 img_tensor = torch.from_numpy(img_np)
 
-            # Write frame directly to mmap (no list accumulation!)
-            frame_mmap[frame_idx] = img_np
+            # Store frame
+            if use_disk_streaming:
+                frame_mmap[frame_idx] = img_np
+            else:
+                frame_list.append(img_tensor)
 
             # Get mask for this frame
             if frame_idx in masks:
@@ -893,14 +1013,16 @@ class SAM3VideoOutput:
                             vis_frame = vis_frame * (1 - 0.5 * obj_mask.unsqueeze(-1)) + 0.5 * mask_rgb
                             combined_mask = torch.max(combined_mask, obj_mask)
                     else:
-                        # Show only selected obj_id
-                        vis_oid = obj_id if obj_id >= 0 and obj_id < frame_mask.shape[0] else 0
-                        obj_mask = frame_mask[vis_oid].float()
-                        if obj_mask.numel() > 0 and obj_mask.max() > 1.0:
-                            obj_mask = obj_mask / 255.0
-                        color = torch.tensor(colors[vis_oid % len(colors)])
-                        mask_rgb = obj_mask.unsqueeze(-1) * color.view(1, 1, 3)
-                        vis_frame = vis_frame * (1 - 0.5 * obj_mask.unsqueeze(-1)) + 0.5 * mask_rgb
+                        # Show only selected obj_ids
+                        vis_oids = selected_obj_ids if selected_obj_ids else list(range(frame_mask.shape[0]))
+                        for vis_oid in vis_oids:
+                            if vis_oid < frame_mask.shape[0]:
+                                obj_mask = frame_mask[vis_oid].float()
+                                if obj_mask.numel() > 0 and obj_mask.max() > 1.0:
+                                    obj_mask = obj_mask / 255.0
+                                color = torch.tensor(colors[vis_oid % len(colors)])
+                                mask_rgb = obj_mask.unsqueeze(-1) * color.view(1, 1, 3)
+                                vis_frame = vis_frame * (1 - 0.5 * obj_mask.unsqueeze(-1)) + 0.5 * mask_rgb
                         # Still compute combined for mask output
                         for oid in range(frame_mask.shape[0]):
                             om = frame_mask[oid].float()
@@ -908,11 +1030,15 @@ class SAM3VideoOutput:
                                 om = om / 255.0
                             combined_mask = torch.max(combined_mask, om)
 
-                    # For mask output, select based on obj_id
-                    if obj_id >= 0 and obj_id < frame_mask.shape[0]:
-                        output_mask = frame_mask[obj_id].float()
-                        if output_mask.numel() > 0 and output_mask.max() > 1.0:
-                            output_mask = output_mask / 255.0
+                    # For mask output, select based on selected_obj_ids
+                    if selected_obj_ids is not None:
+                        output_mask = torch.zeros(h, w)
+                        for oid in selected_obj_ids:
+                            if oid < frame_mask.shape[0]:
+                                om = frame_mask[oid].float()
+                                if om.numel() > 0 and om.max() > 1.0:
+                                    om = om / 255.0
+                                output_mask = torch.max(output_mask, om)
                     else:
                         output_mask = combined_mask
                     frame_mask = output_mask
@@ -934,7 +1060,7 @@ class SAM3VideoOutput:
 
                 # Draw legend on visualization
                 if num_objects > 0:
-                    legend_obj_id = -1 if plot_all_masks else obj_id
+                    legend_obj_ids = selected_obj_ids if (not plot_all_masks and selected_obj_ids) else None
                     # Get scores for this frame
                     frame_scores = None
                     if scores is not None and frame_idx in scores:
@@ -946,41 +1072,56 @@ class SAM3VideoOutput:
                                 frame_scores = frame_scores[0]
                         elif hasattr(frame_scores_tensor, '__iter__'):
                             frame_scores = list(frame_scores_tensor)
-                    vis_frame = self._draw_legend(vis_frame, num_objects, colors, obj_id=legend_obj_id, frame_scores=frame_scores)
+                    vis_frame = self._draw_legend(vis_frame, num_objects, colors, obj_ids=legend_obj_ids, frame_scores=frame_scores)
 
-                # Write directly to mmap instead of appending to list
-                vis_mmap[frame_idx] = np.clip(vis_frame.numpy(), 0, 1)
-                mask_mmap[frame_idx] = frame_mask.cpu().numpy()
+                # Store results
+                if use_disk_streaming:
+                    vis_mmap[frame_idx] = np.clip(vis_frame.numpy(), 0, 1)
+                    mask_mmap[frame_idx] = frame_mask.cpu().numpy()
+                else:
+                    vis_list.append(vis_frame.clamp(0, 1))
+                    mask_list.append(frame_mask.cpu())
             else:
                 # No mask for this frame - use zeros
-                mask_mmap[frame_idx] = np.zeros((h, w), dtype=np.float32)
-                vis_mmap[frame_idx] = img_np
+                if use_disk_streaming:
+                    mask_mmap[frame_idx] = np.zeros((h, w), dtype=np.float32)
+                    vis_mmap[frame_idx] = img_np
+                else:
+                    mask_list.append(torch.zeros(h, w))
+                    vis_list.append(img_tensor)
 
-            # Flush to disk periodically and free memory
-            if frame_idx % 50 == 0 and frame_idx > 0:
+            # Periodic progress and cleanup
+            if use_disk_streaming and frame_idx % 50 == 0 and frame_idx > 0:
                 mask_mmap.flush()
                 frame_mmap.flush()
                 vis_mmap.flush()
                 gc.collect()
                 print(f"[SAM3 Video] Processed {frame_idx}/{num_frames} frames")
 
-        # Final flush
-        mask_mmap.flush()
-        frame_mmap.flush()
-        vis_mmap.flush()
+        # ============================================================
+        # Finalize output tensors
+        # ============================================================
+        if use_disk_streaming:
+            # Final flush
+            mask_mmap.flush()
+            frame_mmap.flush()
+            vis_mmap.flush()
 
-        # ============================================================
-        # Convert mmap to torch tensors (backed by disk, minimal RAM!)
-        # ============================================================
-        all_masks = torch.from_numpy(mask_mmap)
-        all_frames = torch.from_numpy(frame_mmap)
-        all_vis = torch.from_numpy(vis_mmap)
+            # Convert mmap to torch tensors (backed by disk, minimal RAM!)
+            all_masks = torch.from_numpy(mask_mmap)
+            all_frames = torch.from_numpy(frame_mmap)
+            all_vis = torch.from_numpy(vis_mmap)
+        else:
+            # Stack lists into batches
+            all_masks = torch.stack(mask_list, dim=0)  # [N, H, W]
+            all_frames = torch.stack(frame_list, dim=0)  # [N, H, W, C]
+            all_vis = torch.stack(vis_list, dim=0)  # [N, H, W, C]
 
         print(f"[SAM3 Video] Output: {all_masks.shape[0]} masks, shape {all_masks.shape}")
         print(f"[SAM3 Video] Objects tracked: {num_objects}, plot_all_masks: {plot_all_masks}")
         print_vram("After extract")
 
-        # Cache the result (tensors backed by mmap files - minimal RAM)
+        # Cache the result
         result = (all_masks, all_frames, all_vis)
         SAM3VideoOutput._cache[cache_key] = result
 
