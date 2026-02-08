@@ -64,10 +64,11 @@ def create_temp_dir(session_uuid: str) -> str:
         Path to the created temporary directory
     """
     _ensure_cleanup_registered()
-    temp_dir = tempfile.mkdtemp(prefix=f"sam3_{session_uuid[:8]}_")
+    custom_temp_base = "/workspace/temp"
+    os.makedirs(custom_temp_base, exist_ok=True)
+    temp_dir = tempfile.mkdtemp(prefix=f"sam3_{session_uuid[:8]}_", dir=custom_temp_base)
     _TEMP_DIR_REGISTRY.add(temp_dir)
     return temp_dir
-
 
 def cleanup_temp_dir(temp_dir: str):
     """
