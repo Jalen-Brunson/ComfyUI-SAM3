@@ -33,7 +33,8 @@ Author: ComfyUI-SAM3
 Version: 2.1.0
 License: MIT
 """
-
+# At the top of your __init__.py
+from .nodes import h200_optimizations  # Auto-applies optimizations on import
 # Only run initialization and imports when loaded by ComfyUI, not during pytest
 # This prevents relative import errors when pytest collects test modules
 import os
