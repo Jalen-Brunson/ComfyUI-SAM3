@@ -41,8 +41,8 @@ from .nodes import h200_optimizations
 import os
 import sys
 import traceback
-from .nodes.fast_mask_composite import NODE_CLASS_MAPPINGS as FAST_MASK_NODES
-NODE_CLASS_MAPPINGS.update(FAST_MASK_NODES)
+from .nodes.fast_mask_composite import NODE_CLASS_MAPPINGS as FAST_MASK_MAPPINGS
+from .nodes.fast_mask_composite import NODE_DISPLAY_NAME_MAPPINGS as FAST_MASK_DISPLAY
 # Version info
 __version__ = "3.0.0"  # Major refactor for memory management
 
