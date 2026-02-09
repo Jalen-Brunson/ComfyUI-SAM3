@@ -180,23 +180,24 @@ app.registerExtension({
 
             // Mouse event handlers
             canvas.addEventListener("mousedown", (e) => {
+                // Only handle left-click here; right-click is handled by contextmenu
+                if (e.button === 2) return;
+                
                 const rect = canvas.getBoundingClientRect();
                 const x = ((e.clientX - rect.left) / rect.width) * canvas.width;
                 const y = ((e.clientY - rect.top) / rect.height) * canvas.height;
 
                 const activePrompt = this.canvasWidget.prompts[this.canvasWidget.activePromptIndex];
-                const isNegative = e.button === 2;
 
                 // Shift key = box mode
                 if (e.shiftKey) {
-                    this.canvasWidget.currentBox = { x1: x, y1: y, x2: x, y2: y, isNegative };
+                    this.canvasWidget.currentBox = { x1: x, y1: y, x2: x, y2: y, isNegative: false };
                     this.canvasWidget.isDrawingBox = true;
                     return;
                 }
 
-                // Add point (left-click = positive, right-click = negative)
-                const pointList = isNegative ? activePrompt.negative_points : activePrompt.positive_points;
-                pointList.push({ x, y });
+                // Add positive point (left-click only)
+                activePrompt.positive_points.push({ x, y });
                 this.updateStorage();
                 this.redrawCanvas();
             });
@@ -248,12 +249,25 @@ app.registerExtension({
 
             canvas.addEventListener("contextmenu", (e) => {
                 e.preventDefault();
-                canvas.dispatchEvent(new MouseEvent('mousedown', {
-                    button: 2,
-                    clientX: e.clientX,
-                    clientY: e.clientY,
-                    shiftKey: e.shiftKey
-                }));
+                
+                // Handle right-click here (negative points/boxes)
+                const rect = canvas.getBoundingClientRect();
+                const x = ((e.clientX - rect.left) / rect.width) * canvas.width;
+                const y = ((e.clientY - rect.top) / rect.height) * canvas.height;
+
+                const activePrompt = this.canvasWidget.prompts[this.canvasWidget.activePromptIndex];
+
+                // Shift key = negative box mode
+                if (e.shiftKey) {
+                    this.canvasWidget.currentBox = { x1: x, y1: y, x2: x, y2: y, isNegative: true };
+                    this.canvasWidget.isDrawingBox = true;
+                    return;
+                }
+
+                // Add negative point
+                activePrompt.negative_points.push({ x, y });
+                this.updateStorage();
+                this.redrawCanvas();
             });
 
             // Handle image loading
